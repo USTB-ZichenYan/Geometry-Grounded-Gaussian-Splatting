@@ -59,6 +59,12 @@ class ModelParams(ParamGroup):
         self.use_decoupled_appearance = 0 # 0: NO, 1: GS, 2: GOF, 3: PGSR
         self.disable_filter3D = False
         self.kernel_size = 0.0 # Size of 2D filter in mip-splatting
+        self.auto_bg_mask = False
+        self.bg_mask_std_thr = 0.03
+        self.bg_mask_dilate = 5
+        self.freeze_robot_xyz = False
+        self.freeze_robot_rgb = "128,128,128"
+        self.freeze_robot_tol = 3.0
         
         self.multi_view_num = 8
         self.multi_view_max_angle = 30

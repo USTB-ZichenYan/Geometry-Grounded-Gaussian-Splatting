@@ -14,7 +14,7 @@ import sys
 import uuid
 from argparse import ArgumentParser, Namespace
 from random import randint, sample
-from typing import Any, Sequence, TypedDict, Union
+from typing import Any, Optional, Sequence, TypedDict, Union
 
 import cv2
 import numpy as np
@@ -38,6 +38,46 @@ from utils.image_utils import psnr
 from utils.loss_utils import L1_loss_appearance, PatchMatch, l1_loss, ssim
 
 
+def _parse_rgb_triplet(s: str) -> tuple[float, float, float]:
+    parts = [x.strip() for x in str(s).split(",")]
+    if len(parts) != 3:
+        raise ValueError(f"Expected 3 comma-separated values, got: {s}")
+    return (float(parts[0]), float(parts[1]), float(parts[2]))
+
+
+def _build_background_keep_mask(cameras, std_thr: float, dilate_px: int) -> Optional[torch.Tensor]:
+    if not cameras:
+        return None
+    mean = None
+    m2 = None
+    n = 0
+    for cam in cameras:
+        gray = cam.gray_image.squeeze(0).detach().float().cpu()
+        n += 1
+        if mean is None:
+            mean = gray.clone()
+            m2 = torch.zeros_like(gray)
+        else:
+            delta = gray - mean
+            mean = mean + delta / n
+            delta2 = gray - mean
+            m2 = m2 + delta * delta2
+
+    if mean is None:
+        return None
+
+    var = m2 / max(n - 1, 1)
+    keep = var <= float(std_thr) * float(std_thr)
+
+    if dilate_px > 0:
+        dynamic = (~keep).cpu().numpy().astype(np.uint8)
+        kernel = np.ones((2 * dilate_px + 1, 2 * dilate_px + 1), np.uint8)
+        dynamic = cv2.dilate(dynamic, kernel, iterations=1)
+        keep = torch.from_numpy((1 - dynamic).astype(np.uint8)).bool()
+
+    return keep.unsqueeze(0)
+
+
 def training(
     dataset,
     opt,
@@ -51,6 +91,9 @@ def training(
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, dataset.sg_degree)
+    gaussians.freeze_robot_xyz = bool(getattr(dataset, "freeze_robot_xyz", False))
+    gaussians.freeze_robot_rgb = _parse_rgb_triplet(getattr(dataset, "freeze_robot_rgb", "128,128,128"))
+    gaussians.freeze_robot_tol = float(getattr(dataset, "freeze_robot_tol", 3.0))
     scene = Scene(dataset, gaussians)
     gaussians.training_setup(opt)
     if checkpoint:
@@ -64,6 +107,52 @@ def training(
     iter_end = torch.cuda.Event(enable_timing=True)
 
     trainCameras = scene.getTrainCameras().copy()
+    if len(trainCameras) <= 1 and opt.densify_until_iter > 0:
+        print(
+            "[WARN] Single-view training detected. "
+            "Disabling densification for stability."
+        )
+        opt.densify_until_iter = 0
+        opt.densify_from_iter = opt.iterations + 1
+
+    if dataset.auto_bg_mask:
+        all_cameras = scene.getTrainCameras().copy() + scene.getTestCameras().copy()
+        cam_groups = {}
+        for cam in all_cameras:
+            cam_groups.setdefault(cam.colmap_id, []).append(cam)
+
+        enabled_groups = 0
+        for cam_id, group in cam_groups.items():
+            keep_mask = _build_background_keep_mask(
+                group,
+                std_thr=float(dataset.bg_mask_std_thr),
+                dilate_px=int(dataset.bg_mask_dilate),
+            )
+            if keep_mask is None:
+                print(f"[bg-mask] cam={cam_id}: failed to build mask; skip")
+                continue
+
+            keep_ratio = float(keep_mask.float().mean().item())
+            # If nearly everything is masked out, this mask is unusable.
+            if keep_ratio < 0.01:
+                print(
+                    f"[bg-mask] cam={cam_id}: keep_ratio={keep_ratio:.4f} too small; "
+                    "skip this camera mask"
+                )
+                continue
+
+            print(
+                f"[bg-mask] cam={cam_id}: keep_ratio={keep_ratio:.4f}, "
+                f"std_thr={dataset.bg_mask_std_thr}, dilate={dataset.bg_mask_dilate}"
+            )
+            for cam in group:
+                cam.bg_keep_mask = keep_mask.to(cam.data_device)
+            enabled_groups += 1
+
+        if enabled_groups == 0:
+            print("[bg-mask] no valid mask groups; continue without masking")
+        elif len(cam_groups) > 1:
+            print("[bg-mask] multiple camera groups detected. For best background-only results, prefer head-only dataset.")
     if dataset.disable_filter3D:
         gaussians.reset_3D_filter()
     else:
@@ -151,11 +240,19 @@ def training(
             render_pkg["visibility_filter"],
             render_pkg["radii"],
         )
-        gt_image = viewpoint_cam.original_image.cuda()
+        gt_image = viewpoint_cam.original_image.to(rendered_image.device, non_blocking=True)
 
-        Ll1_render = L1_loss_appearance(rendered_image, gt_image, gaussians, viewpoint_cam.uid)
+        keep_mask = getattr(viewpoint_cam, "bg_keep_mask", None)
+        if keep_mask is None and getattr(viewpoint_cam, "gt_mask", None) is not None:
+            keep_mask = (viewpoint_cam.gt_mask > 0.5)
+        if keep_mask is not None:
+            keep_mask_3 = keep_mask.expand_as(gt_image).to(gt_image.device)
+            valid = keep_mask_3.sum().clamp_min(1.0)
+            Ll1_render = (torch.abs(rendered_image - gt_image) * keep_mask_3).sum() / valid
+        else:
+            Ll1_render = L1_loss_appearance(rendered_image, gt_image, gaussians, viewpoint_cam.uid)
         # normal consistency
-        if reg_kick_on and opt.lambda_depth_normal > 0:
+        if reg_kick_on and opt.lambda_depth_normal > 0 and keep_mask is None:
             depth_map: torch.Tensor = render_pkg["median_depth"]
             rendered_normal: torch.Tensor = render_pkg["normal"]
             depth_normal, valid_points = depth_to_normal(viewpoint_cam, depth_map)
@@ -163,20 +260,30 @@ def training(
             depth_normal_loss = torch.where(valid_points.squeeze(), normal_error_map, torch.zeros_like(normal_error_map)).mean()
         else:
             depth_normal = None
-            depth_normal_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
+            depth_normal_loss = torch.tensor([0], dtype=torch.float32, device=rendered_image.device)
 
         # patch match loss
-        if reg_kick_on and (opt.lambda_multi_view_ncc > 0 or opt.lambda_multi_view_geo):
+        if reg_kick_on and (opt.lambda_multi_view_ncc > 0 or opt.lambda_multi_view_geo) and keep_mask is None:
             nearest_cam = None if len(viewpoint_cam.nearest_id) == 0 else scene.getTrainCameras()[sample(viewpoint_cam.nearest_id, 1)[0]]
             ncc_loss, geo_loss = patchmatch(gaussians, render_pkg, viewpoint_cam, nearest_cam, iteration, depth_normal)
         else:
-            ncc_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
-            geo_loss = torch.tensor([0], dtype=torch.float32, device="cuda")
+            ncc_loss = torch.tensor([0], dtype=torch.float32, device=rendered_image.device)
+            geo_loss = torch.tensor([0], dtype=torch.float32, device=rendered_image.device)
 
-        rgb_loss = (1.0 - opt.lambda_dssim) * Ll1_render + opt.lambda_dssim * (1.0 - ssim(rendered_image.unsqueeze(0), gt_image.unsqueeze(0)))
+        if keep_mask is not None:
+            rendered_for_ssim = rendered_image * keep_mask_3
+            gt_for_ssim = gt_image * keep_mask_3
+        else:
+            rendered_for_ssim = rendered_image
+            gt_for_ssim = gt_image
+
+        rgb_loss = (1.0 - opt.lambda_dssim) * Ll1_render + opt.lambda_dssim * (
+            1.0 - ssim(rendered_for_ssim.unsqueeze(0), gt_for_ssim.unsqueeze(0))
+        )
 
         loss = rgb_loss + opt.lambda_depth_normal * depth_normal_loss + opt.lambda_multi_view_ncc * ncc_loss + opt.lambda_multi_view_geo * geo_loss
         loss.backward()
+        gaussians.apply_xyz_grad_mask()
 
         iter_end.record()
 

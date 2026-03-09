@@ -21,10 +21,15 @@ port = 6009
 conn = None
 addr = None
 
-listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+except OSError:
+    listener = None
 
 def init(wish_host, wish_port):
     global host, port, listener
+    if listener is None:
+        return
     host = wish_host
     port = wish_port
     listener.bind((host, port))
@@ -33,6 +38,8 @@ def init(wish_host, wish_port):
 
 def try_connect():
     global conn, addr, listener
+    if listener is None:
+        return
     try:
         conn, addr = listener.accept()
         print(f"\nConnected by {addr}")

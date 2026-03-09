@@ -22,7 +22,9 @@ def inverse_sigmoid(x):
 
 def PILtoTorch(pil_image, resolution):
     resized_image_PIL = pil_image.resize(resolution)
-    resized_image = torch.from_numpy(np.array(resized_image_PIL)) / 255.0
+    # Avoid direct NumPy memory view path due NumPy/PyTorch ABI quirks in some envs.
+    arr = np.asarray(resized_image_PIL, dtype=np.uint8)
+    resized_image = torch.tensor(arr.tolist(), dtype=torch.float32) / 255.0
     if len(resized_image.shape) == 3:
         return resized_image.permute(2, 0, 1)
     else:
@@ -132,7 +134,8 @@ def safe_state(silent):
     random.seed(0)
     np.random.seed(0)
     torch.manual_seed(0)
-    torch.cuda.set_device(torch.device("cuda:0"))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(torch.device("cuda:0"))
 
 def readNormalDmb(file_path):
     try:

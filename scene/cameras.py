@@ -17,6 +17,13 @@ from torch import nn
 
 from utils.graphics_utils import getProjectionMatrix, getWorld2View2
 
+
+def _tensor_f32(x, device: torch.device) -> torch.Tensor:
+    arr = np.asarray(x, dtype=np.float32)
+    # Avoid direct NumPy->Torch view path due dtype/ABI quirks in some envs.
+    return torch.tensor(arr.tolist(), dtype=torch.float32, device=device)
+
+
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
                  image_name, uid,
@@ -38,8 +45,10 @@ class Camera(nn.Module):
             print(f"[Warning] Custom device {data_device} failed, fallback to default cuda device" )
             self.data_device = torch.device("cuda")
 
-        self.R = torch.tensor(R, dtype=torch.float32).cuda()
-        self.T = torch.tensor(T, dtype=torch.float32).cuda()
+        self.render_device = torch.device("cuda" if torch.cuda.is_available() else self.data_device)
+
+        self.R = _tensor_f32(R, self.render_device)
+        self.T = _tensor_f32(T, self.render_device)
 
         self.original_image = image.clamp(0.0, 1.0).to(self.data_device)
         self.gray_image = (0.299 * image[0] + 0.587 * image[1] + 0.114 * image[2])[None].to(self.data_device)
@@ -62,8 +71,10 @@ class Camera(nn.Module):
         self.trans = trans
         self.scale = scale
 
-        self.world_view_transform = torch.tensor(getWorld2View2(R, T, trans, scale)).transpose(0, 1).cuda()
-        self.projection_matrix = getProjectionMatrix(znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy).transpose(0,1).cuda()
+        self.world_view_transform = _tensor_f32(getWorld2View2(R, T, trans, scale), self.render_device).transpose(0, 1)
+        self.projection_matrix = getProjectionMatrix(
+            znear=self.znear, zfar=self.zfar, fovX=self.FoVx, fovY=self.FoVy
+        ).transpose(0, 1).to(self.render_device)
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 

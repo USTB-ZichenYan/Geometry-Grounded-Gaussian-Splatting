@@ -135,7 +135,7 @@ def main() -> None:
     parser.add_argument("--lambda-alpha-fg", type=float, default=0.05)
     parser.add_argument("--freeze-scale", type=int, default=0, help="1: freeze gaussian scale; 0: allow scale learning")
     parser.add_argument("--freeze-rotation", type=int, default=0, help="1: freeze gaussian rotation; 0: allow rotation learning")
-    parser.add_argument("--lock-opacity-one", type=int, default=0, help="1: lock opacity to ~1 (no opacity learning)")
+    parser.add_argument("--lock-opacity-one", type=int, default=1, help="1: lock opacity to ~1 (no opacity learning)")
     parser.add_argument("--scale-init-mul", type=float, default=1.0, help="Multiply initial gaussian scale before training")
     parser.add_argument("--frame-order", choices=["sequential", "random"], default="sequential")
     parser.add_argument("--steps-per-frame", type=int, default=1)

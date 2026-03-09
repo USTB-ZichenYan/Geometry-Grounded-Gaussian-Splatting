@@ -199,26 +199,34 @@ class PatchMatch:
         ##############################################
 
         if iteration % 200 == 0 and self.debug:
-            with torch.no_grad():
-                gt_img_show = (viewpoint_cam.original_image.permute(1, 2, 0).clamp(0, 1)[:, :, [2, 1, 0]] * 255).detach().cpu().numpy().astype(np.uint8)
-                img_show = ((render_pkg["render"]).permute(1, 2, 0).clamp(0, 1)[:, :, [2, 1, 0]] * 255).detach().cpu().numpy().astype(np.uint8)
-                normal_show = (((render_pkg["normal"] + 1.0) * 0.5).permute(1, 2, 0).clamp(0, 1) * 255).detach().cpu().numpy().astype(np.uint8)
-                if depth_normal is None:
-                    depth_normal_show = (
-                        (nearest_cam.original_image.permute(1, 2, 0).clamp(0, 1)[:, :, [2, 1, 0]] * 255).detach().cpu().numpy().astype(np.uint8)
-                    )
-                else:
-                    depth_normal_show = (((depth_normal + 1.0) * 0.5).permute(1, 2, 0).clamp(0, 1) * 255).detach().cpu().numpy().astype(np.uint8)
-                d_mask_show = (weights.float() * 255).detach().cpu().numpy().astype(np.uint8)
-                d_mask_show_color = cv2.applyColorMap(d_mask_show, cv2.COLORMAP_JET)
-                depth = render_pkg["median_depth"].squeeze().detach().cpu().numpy()
-                depth_i = (depth - depth.min()) / (depth.max() - depth.min() + 1e-20)
-                depth_i = (depth_i * 255).clip(0, 255).astype(np.uint8)
-                depth_color = cv2.applyColorMap(depth_i, cv2.COLORMAP_JET)
-                row0 = np.concatenate([gt_img_show, img_show, depth_normal_show], axis=1)
-                row1 = np.concatenate([d_mask_show_color, depth_color, normal_show], axis=1)
-                image_to_show = np.concatenate([row0, row1], axis=0)
-                cv2.imwrite(os.path.join(self.model_path, "debug", "%05d" % iteration + "_" + viewpoint_cam.image_name + ".jpg"), image_to_show)
+            try:
+                with torch.no_grad():
+                    gt_img_show = (viewpoint_cam.original_image.permute(1, 2, 0).clamp(0, 1)[:, :, [2, 1, 0]] * 255).detach().cpu().numpy().astype(np.uint8)
+                    img_show = ((render_pkg["render"]).permute(1, 2, 0).clamp(0, 1)[:, :, [2, 1, 0]] * 255).detach().cpu().numpy().astype(np.uint8)
+                    normal_show = (((render_pkg["normal"] + 1.0) * 0.5).permute(1, 2, 0).clamp(0, 1) * 255).detach().cpu().numpy().astype(np.uint8)
+                    if depth_normal is None:
+                        depth_normal_show = (
+                            (nearest_cam.original_image.permute(1, 2, 0).clamp(0, 1)[:, :, [2, 1, 0]] * 255).detach().cpu().numpy().astype(np.uint8)
+                        )
+                    else:
+                        depth_normal_show = (((depth_normal + 1.0) * 0.5).permute(1, 2, 0).clamp(0, 1) * 255).detach().cpu().numpy().astype(np.uint8)
+                    d_mask_show = (weights.float() * 255).detach().cpu().numpy()
+                    d_mask_show = np.nan_to_num(d_mask_show, nan=0.0, posinf=255.0, neginf=0.0)
+                    if d_mask_show.ndim > 2:
+                        d_mask_show = d_mask_show[..., 0]
+                    d_mask_show = np.ascontiguousarray(np.clip(d_mask_show, 0, 255).astype(np.uint8))
+                    d_mask_show_color = cv2.applyColorMap(d_mask_show, cv2.COLORMAP_JET)
+                    depth = render_pkg["median_depth"].squeeze().detach().cpu().numpy()
+                    depth_i = (depth - depth.min()) / (depth.max() - depth.min() + 1e-20)
+                    depth_i = np.ascontiguousarray((depth_i * 255).clip(0, 255).astype(np.uint8))
+                    depth_color = cv2.applyColorMap(depth_i, cv2.COLORMAP_JET)
+                    row0 = np.concatenate([gt_img_show, img_show, depth_normal_show], axis=1)
+                    row1 = np.concatenate([d_mask_show_color, depth_color, normal_show], axis=1)
+                    image_to_show = np.concatenate([row0, row1], axis=0)
+                    cv2.imwrite(os.path.join(self.model_path, "debug", "%05d" % iteration + "_" + viewpoint_cam.image_name + ".jpg"), image_to_show)
+            except Exception as e:
+                if iteration % 1000 == 0:
+                    print(f"[PatchMatch debug] skipped visualization due to OpenCV/NumPy issue: {e}")
         ################## Compute NCC for warped patches ##################
         if not d_mask.any():
             return torch.tensor([0], dtype=torch.float32, device="cuda"), torch.tensor([0], dtype=torch.float32, device="cuda")

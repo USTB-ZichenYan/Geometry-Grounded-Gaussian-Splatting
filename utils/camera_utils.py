@@ -48,6 +48,15 @@ def loadCam(args, id, cam_info, resolution_scale):
         loaded_mask = None
         gt_image = resized_image_rgb
 
+    if getattr(cam_info, "mask", None) is not None:
+        ext_mask = PILtoTorch(cam_info.mask, resolution)
+        if ext_mask.shape[0] > 1:
+            ext_mask = ext_mask[:1]
+        ext_mask = (ext_mask > 0.5).float()
+        # For COLMAP datasets with explicit masks/, prefer the external mask semantics
+        # over PNG alpha, which may encode foreground transparency for visualization.
+        loaded_mask = ext_mask
+
     return Camera(colmap_id=cam_info.uid, R=cam_info.R, T=cam_info.T, 
                   FoVx=cam_info.FovX, FoVy=cam_info.FovY, 
                   image=gt_image, gt_alpha_mask=loaded_mask,

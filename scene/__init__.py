@@ -71,7 +71,18 @@ class Scene:
         #     random.shuffle(scene_info.train_cameras)  # Multi-res consistent random shuffling
         #     random.shuffle(scene_info.test_cameras)  # Multi-res consistent random shuffling
 
-        self.cameras_extent = scene_info.nerf_normalization["radius"]
+        self.cameras_extent = float(scene_info.nerf_normalization["radius"])
+        if (not np.isfinite(self.cameras_extent)) or self.cameras_extent < 1e-6:
+            # Single-view / static-camera datasets can yield zero COLMAP radius.
+            # Use point-cloud spread as a stable fallback so LR and densification remain well-defined.
+            pts = np.asarray(scene_info.point_cloud.points, dtype=np.float32)
+            if pts.ndim == 2 and pts.shape[0] > 0:
+                ctr = pts.mean(axis=0, keepdims=True)
+                rad = np.linalg.norm(pts - ctr, axis=1)
+                self.cameras_extent = float(np.percentile(rad, 90))
+            if (not np.isfinite(self.cameras_extent)) or self.cameras_extent < 1e-6:
+                self.cameras_extent = 1.0
+            print(f"[WARN] cameras extent invalid from COLMAP, fallback to {self.cameras_extent:.6f}")
 
         for resolution_scale in resolution_scales:
             self.train_cameras[resolution_scale] = cameraList_from_camInfos(scene_info.train_cameras, resolution_scale, args)
@@ -87,7 +98,7 @@ class Scene:
                 for id, cur_cam in enumerate(self.train_cameras[resolution_scale]):
                     camera_centers_list.append(cur_cam.camera_center)
                     R = cur_cam.R
-                    center_ray = torch.tensor([0.0, 0.0, 1.0]).float().cuda()
+                    center_ray = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float32, device=R.device)
                     center_ray = center_ray @ R.transpose(-1, -2)
                     center_rays_list.append(center_ray)
                 camera_centers = torch.stack(camera_centers_list, dim=0)
@@ -126,7 +137,7 @@ class Scene:
             with torch.no_grad():
                 for camera_center in camera_centers_list:
                     dists_cam_gauss = torch.norm(self.gaussians.get_xyz - camera_center[None, :], dim=1)
-                    max_scale = 0.05 * dists_cam_gauss.flatten()
+                    max_scale = torch.clamp(0.05 * dists_cam_gauss.flatten(), min=1e-4)
                     log_max_scale = torch.log(max_scale).repeat(3, 1).permute(1, 0)
                     self.gaussians._scaling[:] = torch.clamp_max(self.gaussians._scaling, log_max_scale)
 

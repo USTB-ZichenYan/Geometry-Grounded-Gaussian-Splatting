@@ -17,11 +17,14 @@ from pathlib import Path
 from typing import NamedTuple
 
 import numpy as np
-import open3d as o3d
 import trimesh
 from PIL import Image
 from plyfile import PlyData, PlyElement
-from scipy.spatial.transform import Rotation
+
+try:
+    import open3d as o3d  # type: ignore
+except Exception:
+    o3d = None
 
 from scene.colmap_loader import (
     qvec2rotmat,
@@ -57,6 +60,10 @@ class SceneInfo(NamedTuple):
     ply_path: str
 
 def getNerfppNorm(cam_info):
+    if cam_info is None or len(cam_info) == 0:
+        # Robust fallback for degenerate splits (e.g. single-frame test split).
+        return {"translate": np.zeros((3,), dtype=np.float32), "radius": 1.0}
+
     def get_center_and_diag(cam_centers):
         cam_centers = np.hstack(cam_centers)
         avg_cam_center = np.mean(cam_centers, axis=1, keepdims=True)
@@ -121,7 +128,7 @@ def read_pfm(filename: str):
     return data, scale
 
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, masks_folder=None):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -154,9 +161,14 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
         image = Image.open(image_path)
+        mask = None
+        if masks_folder is not None:
+            mask_path = os.path.join(masks_folder, os.path.basename(extr.name))
+            if os.path.exists(mask_path):
+                mask = Image.open(mask_path).convert("L")
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,  
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                              image_path=image_path, image_name=image_name, width=width, height=height, mask=mask)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -170,6 +182,8 @@ def fetchPly(path):
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
 def fetchOpen3DPly(path):
+    if o3d is None:
+        raise ImportError("open3d is not available in this environment")
     plydata = o3d.io.read_point_cloud(path)
     positions = np.asarray(plydata.points)
     colors = np.asarray(plydata.colors)
@@ -209,7 +223,15 @@ def readColmapSceneInfo(path, images, eval, llffhold=8):
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    masks_dir = os.path.join(path, "masks")
+    if not os.path.isdir(masks_dir):
+        masks_dir = None
+    cam_infos_unsorted = readColmapCameras(
+        cam_extrinsics=cam_extrinsics,
+        cam_intrinsics=cam_intrinsics,
+        images_folder=os.path.join(path, reading_dir),
+        masks_folder=masks_dir,
+    )
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:

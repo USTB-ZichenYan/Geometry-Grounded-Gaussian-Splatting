@@ -84,6 +84,10 @@ class GaussianModel:
         self.setup_functions()
         self.appearance_network: Optional[AppearanceNetwork] = None
         self._appearance_embeddings: Optional[torch.nn.Parameter] = None
+        self.freeze_robot_xyz: bool = False
+        self.freeze_robot_rgb: tuple[float, float, float] = (128.0, 128.0, 128.0)
+        self.freeze_robot_tol: float = 3.0
+        self._xyz_frozen_mask: Optional[torch.Tensor] = None
 
     def capture(self):
         if self.app_model == self.App_model.GOF:
@@ -174,12 +178,32 @@ class GaussianModel:
 
     @property
     def get_sg_axis(self):
-        axis = torch.nn.functional.normalize(self._sg_axis, dim=2)
+        axis = self._sg_axis
+        # In some NumPy/PyTorch combinations, loading an empty (N, 0, 3) array
+        # may collapse to (N, 0). Canonicalize back to (N, S, 3).
+        if axis.ndim == 2:
+            if axis.shape[1] == 0:
+                axis = axis.reshape(axis.shape[0], 0, 3)
+            elif axis.shape[1] % 3 == 0:
+                axis = axis.reshape(axis.shape[0], axis.shape[1] // 3, 3)
+            else:
+                axis = axis.unsqueeze(1)
+        if axis.numel() == 0:
+            return axis
+        axis = torch.nn.functional.normalize(axis, dim=2)
         return axis
 
     @property
     def get_sg_color(self):
-        return self._sg_color
+        color = self._sg_color
+        if color.ndim == 2:
+            if color.shape[1] == 0:
+                color = color.reshape(color.shape[0], 0, 3)
+            elif color.shape[1] % 3 == 0:
+                color = color.reshape(color.shape[0], color.shape[1] // 3, 3)
+            else:
+                color = color.unsqueeze(1)
+        return color
 
     @property
     def get_opacity(self):
@@ -256,7 +280,18 @@ class GaussianModel:
             valid_points = torch.logical_or(valid_points, valid)
             focal_length = max(focal_length, camera.Fx)
 
-        distance[~valid_points] = distance[valid_points].max()
+        if focal_length <= 1e-6:
+            focal_length = 1.0
+
+        if torch.any(valid_points):
+            distance[~valid_points] = distance[valid_points].max()
+        else:
+            # Fallback for badly aligned initial cameras/points:
+            # use nearest camera-center distance to keep filter finite.
+            cam_centers = torch.stack([cam.camera_center.to(xyz.device) for cam in cameras], dim=0)
+            distance = torch.cdist(xyz, cam_centers).min(dim=1).values
+            distance = torch.clamp(distance, min=0.2)
+            print("[WARN] compute_3D_filter: no valid projected points, using camera-center distance fallback.")
 
         filter_3D = distance / focal_length * (0.2**0.5)
         self.filter_3D = filter_3D[..., None]
@@ -303,29 +338,39 @@ class GaussianModel:
 
     def create_from_pcd(self, pcd, spatial_lr_scale: float):
         self.spatial_lr_scale = spatial_lr_scale
+        dev = torch.device("cuda")
+
+        def _as_f32_tensor(x):
+            arr = np.asarray(x, dtype=np.float32)
+            # Avoid direct NumPy view path (can fail with ABI/type mismatches in some envs).
+            return torch.tensor(arr.tolist(), dtype=torch.float32, device=dev)
+
+        raw_rgb_np: np.ndarray | None = None
         if isinstance(pcd, BasicPointCloud):
-            fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
-            fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
+            fused_point_cloud = _as_f32_tensor(pcd.points)
+            raw_rgb_np = np.asarray(pcd.colors, dtype=np.float32)
+            fused_color = RGB2SH(_as_f32_tensor(raw_rgb_np))
         else:
-            fused_point_cloud = torch.tensor(np.asarray(pcd._xyz)).float().cuda()
-            fused_color = RGB2SH(torch.tensor(np.asarray(pcd._rgb)).float().cuda())
-        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
+            fused_point_cloud = _as_f32_tensor(pcd._xyz)
+            raw_rgb_np = np.asarray(pcd._rgb, dtype=np.float32)
+            fused_color = RGB2SH(_as_f32_tensor(raw_rgb_np))
+        features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2), dtype=torch.float32, device=dev)
         features[:, :3, 0] = fused_color
         features[:, 3:, 1:] = 0.0
 
-        sg_axis = torch.randn(fused_point_cloud.shape[0], self.max_sg_degree, 3).float().cuda()
+        sg_axis = torch.randn(fused_point_cloud.shape[0], self.max_sg_degree, 3, dtype=torch.float32, device=dev)
         sg_axis = torch.nn.functional.normalize(sg_axis, dim=2)
-        sg_sharpness = torch.zeros(fused_point_cloud.shape[0], self.max_sg_degree).float().cuda()
-        sg_color = torch.zeros(fused_point_cloud.shape[0], self.max_sg_degree, 3).float().cuda()
+        sg_sharpness = torch.zeros(fused_point_cloud.shape[0], self.max_sg_degree, dtype=torch.float32, device=dev)
+        sg_color = torch.zeros(fused_point_cloud.shape[0], self.max_sg_degree, 3, dtype=torch.float32, device=dev)
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
-        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud.detach().clone().float().cuda()), 0.0000001)
+        dist2 = torch.clamp_min(distCUDA2(fused_point_cloud.detach().clone().float()), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[..., None].repeat(1, 3)
-        rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
+        rots = torch.zeros((fused_point_cloud.shape[0], 4), device=dev)
         rots[:, 0] = 1
 
-        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device="cuda"))
+        opacities = inverse_sigmoid(0.1 * torch.ones((fused_point_cloud.shape[0], 1), dtype=torch.float, device=dev))
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._features_dc = nn.Parameter(features[:, :, 0:1].transpose(1, 2).contiguous().requires_grad_(True))
@@ -337,7 +382,47 @@ class GaussianModel:
         self._sg_sharpness = nn.Parameter(sg_sharpness.requires_grad_(True))
         self._sg_color = nn.Parameter(sg_color.requires_grad_(True))
 
-        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device=dev)
+        self._init_xyz_frozen_mask(raw_rgb_np)
+
+    def _init_xyz_frozen_mask(self, rgb01: np.ndarray | None) -> None:
+        self._xyz_frozen_mask = None
+        if not self.freeze_robot_xyz:
+            return
+        if rgb01 is None:
+            print("[freeze-xyz] enabled but no RGB data in init point cloud; skip.")
+            return
+
+        rgb01 = np.asarray(rgb01, dtype=np.float32)
+        if rgb01.ndim != 2 or rgb01.shape[1] != 3:
+            print(f"[freeze-xyz] unexpected RGB shape {rgb01.shape}; skip.")
+            return
+
+        target = np.asarray(self.freeze_robot_rgb, dtype=np.float32)
+        tol = float(self.freeze_robot_tol)
+        if np.max(target) > 1.5:
+            target = target / 255.0
+            tol = tol / 255.0
+
+        m = np.all(np.abs(rgb01 - target[None, :]) <= tol, axis=1)
+        n = int(m.sum())
+        if n <= 0:
+            print(
+                "[freeze-xyz] enabled but no matching points found. "
+                "Check --freeze_robot_rgb / --freeze_robot_tol."
+            )
+            return
+        m_bool = np.asarray(m, dtype=np.bool_)
+        # Avoid torch.from_numpy in environments with NumPy ABI mismatch.
+        self._xyz_frozen_mask = torch.tensor(m_bool.tolist(), dtype=torch.bool, device=self._xyz.device)
+        print(f"[freeze-xyz] frozen xyz points: {n}/{m.shape[0]}")
+
+    def apply_xyz_grad_mask(self) -> None:
+        if self._xyz_frozen_mask is None:
+            return
+        if self._xyz.grad is None:
+            return
+        self._xyz.grad[self._xyz_frozen_mask] = 0
 
     def training_setup(self, training_args: OptimizationParams) -> None:
         self._init_gradient_accumulators()
@@ -472,23 +557,52 @@ class GaussianModel:
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
 
-        xyz = self._xyz.detach().cpu().numpy()
-        normals = np.zeros_like(xyz)
-        f_dc = self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        f_rest = self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
-        opacities = self._opacity.detach().cpu().numpy()
-        scale = self._scaling.detach().cpu().numpy()
-        rotation = self._rotation.detach().cpu().numpy()
-        sg_axis = self._sg_axis.detach().flatten(start_dim=1).contiguous().cpu().numpy()
-        sg_sharpness = self._sg_sharpness.detach().cpu().numpy()
-        sg_color = self._sg_color.detach().flatten(start_dim=1).contiguous().cpu().numpy()
+        xyz = np.asarray(self._xyz.detach().cpu().numpy(), dtype=np.float32)
+        normals = np.zeros_like(xyz, dtype=np.float32)
+        f_dc = np.asarray(
+            self._features_dc.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy(),
+            dtype=np.float32,
+        )
+        f_rest = np.asarray(
+            self._features_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy(),
+            dtype=np.float32,
+        )
+        opacities = np.asarray(self._opacity.detach().cpu().numpy(), dtype=np.float32).reshape(-1)
+        scale = np.asarray(self._scaling.detach().cpu().numpy(), dtype=np.float32)
+        rotation = np.asarray(self._rotation.detach().cpu().numpy(), dtype=np.float32)
+        sg_axis = np.asarray(self._sg_axis.detach().flatten(start_dim=1).contiguous().cpu().numpy(), dtype=np.float32)
+        sg_sharpness = np.asarray(self._sg_sharpness.detach().cpu().numpy(), dtype=np.float32)
+        sg_color = np.asarray(self._sg_color.detach().flatten(start_dim=1).contiguous().cpu().numpy(), dtype=np.float32)
 
-        filter_3D = self.filter_3D.detach().cpu().numpy()
+        if getattr(self, "filter_3D", None) is None:
+            filter_3D = np.zeros((xyz.shape[0], 1), dtype=np.float32)
+        else:
+            filter_3D = np.asarray(self.filter_3D.detach().cpu().numpy(), dtype=np.float32).reshape(-1, 1)
         dtype_full = [(attribute, "f4") for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation, sg_axis, sg_sharpness, sg_color, filter_3D), axis=1)
-        elements[:] = list(map(tuple, attributes))
+        elements["x"] = xyz[:, 0]
+        elements["y"] = xyz[:, 1]
+        elements["z"] = xyz[:, 2]
+        elements["nx"] = normals[:, 0]
+        elements["ny"] = normals[:, 1]
+        elements["nz"] = normals[:, 2]
+        for i in range(f_dc.shape[1]):
+            elements[f"f_dc_{i}"] = f_dc[:, i]
+        for i in range(f_rest.shape[1]):
+            elements[f"f_rest_{i}"] = f_rest[:, i]
+        elements["opacity"] = opacities
+        for i in range(scale.shape[1]):
+            elements[f"scale_{i}"] = scale[:, i]
+        for i in range(rotation.shape[1]):
+            elements[f"rot_{i}"] = rotation[:, i]
+        for i in range(sg_axis.shape[1]):
+            elements[f"sg_axis_{i}"] = sg_axis[:, i]
+        for i in range(sg_sharpness.shape[1]):
+            elements[f"sg_sharpness_{i}"] = sg_sharpness[:, i]
+        for i in range(sg_color.shape[1]):
+            elements[f"sg_color_{i}"] = sg_color[:, i]
+        elements["filter_3D"] = filter_3D[:, 0]
         el = PlyElement.describe(elements, "vertex")
         PlyData([el]).write(path)
 
@@ -540,6 +654,7 @@ class GaussianModel:
 
     def load_ply(self, path):
         plydata = PlyData.read(path)
+        dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         xyz = np.stack((np.asarray(plydata.elements[0]["x"]), np.asarray(plydata.elements[0]["y"]), np.asarray(plydata.elements[0]["z"])), axis=1)
         opacities = np.asarray(plydata.elements[0]["opacity"])[..., np.newaxis]
@@ -592,20 +707,20 @@ class GaussianModel:
         for idx, attr_name in enumerate(rot_names):
             rots[:, idx] = np.asarray(plydata.elements[0][attr_name])
 
-        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device="cuda").requires_grad_(True))
+        self._xyz = nn.Parameter(torch.tensor(xyz, dtype=torch.float, device=dev).requires_grad_(True))
         self._features_dc = nn.Parameter(
-            torch.tensor(features_dc, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True)
+            torch.tensor(features_dc, dtype=torch.float, device=dev).transpose(1, 2).contiguous().requires_grad_(True)
         )
         self._features_rest = nn.Parameter(
-            torch.tensor(features_extra, dtype=torch.float, device="cuda").transpose(1, 2).contiguous().requires_grad_(True)
+            torch.tensor(features_extra, dtype=torch.float, device=dev).transpose(1, 2).contiguous().requires_grad_(True)
         )
-        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._sg_axis = nn.Parameter(torch.tensor(sg_axis, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._sg_sharpness = nn.Parameter(torch.tensor(sg_sharpness, dtype=torch.float, device="cuda").requires_grad_(True))
-        self._sg_color = nn.Parameter(torch.tensor(sg_color, dtype=torch.float, device="cuda").requires_grad_(True))
-        self.filter_3D = torch.tensor(filter_3D, dtype=torch.float, device="cuda")
+        self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device=dev).requires_grad_(True))
+        self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device=dev).requires_grad_(True))
+        self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device=dev).requires_grad_(True))
+        self._sg_axis = nn.Parameter(torch.tensor(sg_axis, dtype=torch.float, device=dev).requires_grad_(True))
+        self._sg_sharpness = nn.Parameter(torch.tensor(sg_sharpness, dtype=torch.float, device=dev).requires_grad_(True))
+        self._sg_color = nn.Parameter(torch.tensor(sg_color, dtype=torch.float, device=dev).requires_grad_(True))
+        self.filter_3D = torch.tensor(filter_3D, dtype=torch.float, device=dev)
 
         self.active_sh_degree = self.max_sh_degree
         self.active_sg_degree = self.max_sg_degree
@@ -665,6 +780,8 @@ class GaussianModel:
         self.xyz_gradient_accum_abs = self.xyz_gradient_accum_abs[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        if self._xyz_frozen_mask is not None:
+            self._xyz_frozen_mask = self._xyz_frozen_mask[valid_points_mask]
 
     def prune_points_inference(self, mask):
         valid_points_mask = ~mask
@@ -679,6 +796,8 @@ class GaussianModel:
         self._sg_sharpness = self._sg_sharpness[valid_points_mask]
         self._sg_color = self._sg_color[valid_points_mask]
         self.filter_3D = self.filter_3D[valid_points_mask]
+        if self._xyz_frozen_mask is not None:
+            self._xyz_frozen_mask = self._xyz_frozen_mask[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -733,9 +852,17 @@ class GaussianModel:
         self.xyz_gradient_accum_abs = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        if self._xyz_frozen_mask is not None:
+            ext = torch.zeros((new_xyz.shape[0],), device=self._xyz_frozen_mask.device, dtype=torch.bool)
+            self._xyz_frozen_mask = torch.cat([self._xyz_frozen_mask, ext], dim=0)
 
     def densify_and_split(self, grads, grad_threshold, grads_abs, grad_abs_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
+        if torch.is_tensor(scene_extent):
+            scene_extent = float(scene_extent.detach().cpu().item())
+        else:
+            scene_extent = float(scene_extent)
+        dense_cutoff = self.percent_dense * scene_extent
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[: grads.shape[0]] = grads.squeeze()
@@ -744,15 +871,22 @@ class GaussianModel:
         padded_grad_abs[: grads_abs.shape[0]] = grads_abs.squeeze()
         selected_pts_mask_abs = torch.where(padded_grad_abs >= grad_abs_threshold, True, False)
         # selected_pts_mask = torch.logical_or(selected_pts_mask, selected_pts_mask_abs)
-        selected_pts_mask = torch.logical_and(selected_pts_mask, torch.max(self.get_scaling, dim=1).values > self.percent_dense * scene_extent)
+        scaling = self.get_scaling
+        valid_scaling = torch.isfinite(scaling).all(dim=1) & (scaling > 0).all(dim=1)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, torch.max(scaling, dim=1).values > dense_cutoff)
         selected_pts_mask = torch.logical_or(selected_pts_mask, selected_pts_mask_abs)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, valid_scaling)
 
-        stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
+        if not torch.any(selected_pts_mask):
+            return
+
+        stds = scaling[selected_pts_mask].repeat(N, 1)
+        stds = torch.nan_to_num(stds, nan=1e-4, posinf=1.0, neginf=1e-4).clamp_min(1e-6)
         means = torch.zeros((stds.size(0), 3), device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask]).repeat(N, 1, 1)
         new_xyz = torch.bmm(rots, samples.unsqueeze(-1)).squeeze(-1) + self.get_xyz[selected_pts_mask].repeat(N, 1)
-        new_scaling = self.scaling_inverse_activation(self.get_scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N))
+        new_scaling = self.scaling_inverse_activation((scaling[selected_pts_mask].repeat(N, 1) / (0.8 * N)).clamp_min(1e-6))
         new_rotation = self._rotation[selected_pts_mask].repeat(N, 1)
         new_features_dc = self._features_dc[selected_pts_mask].repeat(N, 1, 1)
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N, 1, 1)
@@ -768,13 +902,25 @@ class GaussianModel:
         self.prune_points(prune_filter)
 
     def densify_and_clone(self, grads, grad_threshold, grads_abs, grad_abs_threshold, scene_extent):
+        if torch.is_tensor(scene_extent):
+            scene_extent = float(scene_extent.detach().cpu().item())
+        else:
+            scene_extent = float(scene_extent)
+        dense_cutoff = self.percent_dense * scene_extent
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
-        selected_pts_mask = torch.logical_and(selected_pts_mask, torch.max(self.get_scaling, dim=1).values <= self.percent_dense * scene_extent)
+        scaling = self.get_scaling
+        valid_scaling = torch.isfinite(scaling).all(dim=1) & (scaling > 0).all(dim=1)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, torch.max(scaling, dim=1).values <= dense_cutoff)
+        selected_pts_mask = torch.logical_and(selected_pts_mask, valid_scaling)
+
+        if not torch.any(selected_pts_mask):
+            return
 
         new_xyz = self._xyz[selected_pts_mask]
         # sample a new gaussian instead of fixing position
-        stds = self.get_scaling[selected_pts_mask]
+        stds = scaling[selected_pts_mask]
+        stds = torch.nan_to_num(stds, nan=1e-4, posinf=1.0, neginf=1e-4).clamp_min(1e-6)
         means = torch.zeros((stds.size(0), 3), device="cuda")
         samples = torch.normal(mean=means, std=stds)
         rots = build_rotation(self._rotation[selected_pts_mask])
