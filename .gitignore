@@ -31,3 +31,9 @@ CMakeCache.txt
 cmake.check_cache
 blender_scripts/
 .clangd
+
+# Project runtime outputs
+gggs_run/
+*.pth
+*.npz
+*.ply

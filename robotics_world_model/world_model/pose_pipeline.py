@@ -1,21 +1,10 @@
 """
 Compute camera poses from robot joint vector q.
 
-Output:
-  JSON list with 3 records per frame: head / left_wrist / right_wrist.
-  Each record contains pose (T_base_cam) and K.
+Mainline only:
+  p_base -> T_head_base_to_cam (w2c) -> perspective divide -> K -> pixel
 
-Copy-paste run:
-  ROOT=/home/SENSETIME/yanzichen/data/file/Geometry-Grounded-Gaussian-Splatting
-  WM_ROOT="$ROOT/robotics_world_model"
-  PYTHONPATH="$WM_ROOT" python3 -m world_model.pose_pipeline \
-    --q "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0" \
-    --frame-id frame_000000 \
-    --out "$ROOT/poses.json"
-
-Optional:
-  - --q can also be a .npy/.json/.txt file path.
-  - --left-tcp-cam / --right-tcp-cam accepts 4x4 tcp->camera extrinsic.
+Head camera pose is a fixed 4x4 matrix in projection semantics (base -> camera, w2c).
 """
 
 from __future__ import annotations
@@ -28,6 +17,7 @@ from pathlib import Path
 from typing import Iterable
 
 import numpy as np
+
 try:
     from .kinematics_common import (
         DEFAULT_URDF,
@@ -54,19 +44,24 @@ def _eye4() -> np.ndarray:
     return np.eye(4, dtype=np.float32)
 
 
-def _default_T_head_link_cam() -> np.ndarray:
-    T = np.eye(4, dtype=np.float32)
-    # Fixed conversion from URDF head_link frame to optical camera frame
-    # (x right, y down, z forward; COLMAP-compatible after inversion).
-    T[:3, :3] = np.array(
-        [
-            [0.0, -1.0, 0.0],
-            [0.0, 0.0, -1.0],
-            [1.0, 0.0, 0.0],
-        ],
-        dtype=np.float32,
-    )
-    return T
+_CALIB_PATH = Path(__file__).with_name("head_camera_calib.json")
+
+
+def _load_head_calib() -> dict:
+    if not _CALIB_PATH.exists():
+        raise FileNotFoundError(f"Camera calibration file not found: {_CALIB_PATH}")
+    obj = json.loads(_CALIB_PATH.read_text())
+    if "head" not in obj:
+        raise KeyError(f"Invalid calibration file (missing 'head'): {_CALIB_PATH}")
+    return obj
+
+
+def _default_T_head_base_to_cam() -> np.ndarray:
+    calib = _load_head_calib()
+    w2c = np.asarray(calib["head"]["w2c"], dtype=np.float32)
+    if w2c.shape != (4, 4):
+        raise ValueError(f"head.w2c must be 4x4 in {_CALIB_PATH}, got {w2c.shape}")
+    return w2c
 
 
 @dataclass(frozen=True)
@@ -93,10 +88,10 @@ class PoseConfig:
     left_ee_link: str = LEFT_EE_LINK
     right_ee_link: str = RIGHT_EE_LINK
 
-    # Head camera extrinsic (head_link -> head_camera_frame)
-    T_head_link_cam: np.ndarray = dataclasses.field(default_factory=_default_T_head_link_cam)
+    # Fixed direct head pose in projection semantics: base -> camera (w2c).
+    T_head_base_to_cam: np.ndarray = dataclasses.field(default_factory=_default_T_head_base_to_cam)
 
-    # Hand-eye extrinsics (TCP -> camera)
+    # Hand-eye extrinsics (TCP -> camera) used by wrist cameras.
     T_left_tcp_cam: np.ndarray = dataclasses.field(default_factory=_eye4)
     T_right_tcp_cam: np.ndarray = dataclasses.field(default_factory=_eye4)
 
@@ -117,10 +112,8 @@ class PosePipeline:
 
     def compute_poses(self, q: np.ndarray) -> dict[str, np.ndarray]:
         q_map = build_q_map_from_q32(np.asarray(q, dtype=np.float32))
-        link_T_world = compute_link_transforms(
-            Path(self.cfg.urdf_path),
-            q_map=q_map,
-        )
+        link_T_world = compute_link_transforms(Path(self.cfg.urdf_path), q_map=q_map)
+
         if self.cfg.head_link not in link_T_world:
             raise KeyError(f"Head link '{self.cfg.head_link}' not found in URDF FK transforms.")
         if self.cfg.left_ee_link not in link_T_world:
@@ -128,18 +121,17 @@ class PosePipeline:
         if self.cfg.right_ee_link not in link_T_world:
             raise KeyError(f"Right EE link '{self.cfg.right_ee_link}' not found in URDF FK transforms.")
 
-        T_base_head_link = link_T_world[self.cfg.head_link]
         T_base_left_tcp = link_T_world[self.cfg.left_ee_link]
         T_base_right_tcp = link_T_world[self.cfg.right_ee_link]
 
-        T_base_head = T_base_head_link @ self.cfg.T_head_link_cam
-        T_base_left_cam = T_base_left_tcp @ self.cfg.T_left_tcp_cam
-        T_base_right_cam = T_base_right_tcp @ self.cfg.T_right_tcp_cam
+        T_head_w2c = np.asarray(self.cfg.T_head_base_to_cam, dtype=np.float32)
+        T_left_w2c = (T_base_left_tcp @ self.cfg.T_left_tcp_cam).astype(np.float32)
+        T_right_w2c = (T_base_right_tcp @ self.cfg.T_right_tcp_cam).astype(np.float32)
 
         return {
-            "head": T_base_head,
-            "left_wrist": T_base_left_cam,
-            "right_wrist": T_base_right_cam,
+            "head": T_head_w2c,
+            "left_wrist": T_left_w2c,
+            "right_wrist": T_right_w2c,
         }
 
     def to_records(self, frame_id: str, poses: dict[str, np.ndarray]) -> list[PoseRecord]:
@@ -174,18 +166,34 @@ def save_pose_json(records: Iterable[PoseRecord], out_path: Path) -> None:
 
 
 def build_default_intrinsics() -> tuple[CameraIntrinsics, CameraIntrinsics]:
-    # Default intrinsics for 1280x720 captures used in this project.
-    head_K = CameraIntrinsics(fx=1200.0, fy=1200.0, cx=640.0, cy=360.0, width=1280, height=720)
-    wrist_K = CameraIntrinsics(fx=1200.0, fy=1200.0, cx=640.0, cy=360.0, width=1280, height=720)
+    calib = _load_head_calib()
+    h = calib["head"]
+    w = calib.get("wrist", h)
+    head_K = CameraIntrinsics(
+        fx=float(h["fx"]),
+        fy=float(h["fy"]),
+        cx=float(h["cx"]),
+        cy=float(h["cy"]),
+        width=int(h["width"]),
+        height=int(h["height"]),
+    )
+    wrist_K = CameraIntrinsics(
+        fx=float(w["fx"]),
+        fy=float(w["fy"]),
+        cx=float(w["cx"]),
+        cy=float(w["cy"]),
+        width=int(w.get("width", h["width"])),
+        height=int(w.get("height", h["height"])),
+    )
     return head_K, wrist_K
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Pose pipeline: q -> three camera poses")
+    parser = argparse.ArgumentParser(description="Pose pipeline: q -> camera w2c poses")
     parser.add_argument("--q", required=True, help="Comma/space-separated q or a path to .npy/.json/.txt")
     parser.add_argument("--frame-id", default="frame_000000", help="Frame id for output json")
     parser.add_argument("--out", default="poses.json", help="Output json path")
-    parser.add_argument("--head-link-cam", default=None, help="4x4 extrinsic (head_link->head cam) .json/.npy")
+
     parser.add_argument("--left-tcp-cam", default=None, help="4x4 extrinsic (tcp->left cam) .json/.npy")
     parser.add_argument("--right-tcp-cam", default=None, help="4x4 extrinsic (tcp->right cam) .json/.npy")
 
@@ -193,8 +201,7 @@ def main() -> None:
 
     q = _load_q(args.q)
     cfg = PoseConfig()
-    if args.head_link_cam:
-        cfg = dataclasses.replace(cfg, T_head_link_cam=_load_T(args.head_link_cam))
+
     if args.left_tcp_cam:
         cfg = dataclasses.replace(cfg, T_left_tcp_cam=_load_T(args.left_tcp_cam))
     if args.right_tcp_cam:
@@ -202,7 +209,6 @@ def main() -> None:
 
     head_K, wrist_K = build_default_intrinsics()
     pipeline = PosePipeline(cfg, head_K, wrist_K)
-
     poses = pipeline.compute_poses(q)
     records = pipeline.to_records(args.frame_id, poses)
     save_pose_json(records, Path(args.out))

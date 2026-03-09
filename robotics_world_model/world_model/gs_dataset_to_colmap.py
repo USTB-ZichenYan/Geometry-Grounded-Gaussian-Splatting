@@ -4,7 +4,7 @@ Convert gs_dataset output to COLMAP text format.
 Output directory:
   out_dir/
     images/
-    masks/                  # optional, per-image background keep mask from FK
+    masks/                  # optional, per-image background keep mask from green screen or FK
     sparse/0/cameras.txt
     sparse/0/images.txt
     sparse/0/points3D.txt
@@ -16,19 +16,19 @@ Copy-paste run:
     --in-dir "$ROOT/gs_dataset" \
     --out-dir "$ROOT/gs_colmap" \
     --init-npz "$ROOT/gs_init.npz" \
+    --bg-num-points 20000 \
     --init-max-points 200000 \
     --init-color 128,128,128
 
 Note:
-  poses.json may be camera-to-world (T_wc) or world-to-camera (T_cw).
-  This script supports --pose-convention {auto,c2w,w2c}.
+  This project uses w2c poses from pose_pipeline/head_camera_calib.json.
+  We keep --pose-convention for explicitness but only accept w2c.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import re
 import shutil
 from collections import defaultdict
@@ -38,11 +38,6 @@ from typing import Any
 
 import numpy as np
 from PIL import Image
-
-try:  # pragma: no cover
-    import cv2  # type: ignore
-except Exception:  # pragma: no cover
-    cv2 = None  # type: ignore
 
 try:
     from .kinematics_common import build_q_map_from_q32, compute_link_transforms
@@ -79,22 +74,23 @@ def _load_json(path: Path) -> Any:
 
 
 def _rot_to_qvec(R: np.ndarray) -> np.ndarray:
-    # COLMAP expects qw, qx, qy, qz
+    # COLMAP expects [qw, qx, qy, qz].
+    # Keep this implementation consistent with COLMAP `rotmat2qvec`.
+    Rxx, Ryx, Rzx, Rxy, Ryy, Rzy, Rxz, Ryz, Rzz = R.flat
     K = np.array(
         [
-            [R[0, 0] - R[1, 1] - R[2, 2], 0.0, 0.0, 0.0],
-            [R[1, 0] + R[0, 1], R[1, 1] - R[0, 0] - R[2, 2], 0.0, 0.0],
-            [R[2, 0] + R[0, 2], R[2, 1] + R[1, 2], R[2, 2] - R[0, 0] - R[1, 1], 0.0],
-            [R[1, 2] - R[2, 1], R[2, 0] - R[0, 2], R[0, 1] - R[1, 0], R[0, 0] + R[1, 1] + R[2, 2]],
+            [Rxx - Ryy - Rzz, 0.0, 0.0, 0.0],
+            [Ryx + Rxy, Ryy - Rxx - Rzz, 0.0, 0.0],
+            [Rzx + Rxz, Rzy + Ryz, Rzz - Rxx - Ryy, 0.0],
+            [Ryz - Rzy, Rzx - Rxz, Rxy - Ryx, Rxx + Ryy + Rzz],
         ],
         dtype=np.float64,
-    )
-    K /= 3.0
-    w, V = np.linalg.eigh(K)
-    q = V[:, np.argmax(w)]
-    if q[3] < 0:
-        q = -q
-    return np.array([q[3], q[0], q[1], q[2]], dtype=np.float64)
+    ) / 3.0
+    eigvals, eigvecs = np.linalg.eigh(K)
+    qvec = eigvecs[[3, 0, 1, 2], np.argmax(eigvals)]
+    if qvec[0] < 0:
+        qvec *= -1.0
+    return qvec.astype(np.float64)
 
 
 def _write_cameras_txt(out_dir: Path, cams: list[CameraDef]) -> None:
@@ -270,86 +266,36 @@ def _build_background_keep_mask_from_fk(
         dyn[vi, ui] = 1
 
     if radius_px > 0 and np.any(dyn):
-        if cv2 is None:
-            pad = int(radius_px)
-            ys, xs = np.nonzero(dyn)
-            for y, x in zip(ys, xs):
-                y0 = max(0, y - pad)
-                y1 = min(h, y + pad + 1)
-                x0 = max(0, x - pad)
-                x1 = min(w, x + pad + 1)
-                dyn[y0:y1, x0:x1] = 1
-        else:
-            k = np.ones((2 * int(radius_px) + 1, 2 * int(radius_px) + 1), np.uint8)
-            dyn = cv2.dilate(dyn, k, iterations=1)
+        # Avoid OpenCV dependency here due occasional NumPy/OpenCV ABI mismatch in some envs.
+        pad = int(radius_px)
+        ys, xs = np.nonzero(dyn)
+        for y, x in zip(ys, xs):
+            y0 = max(0, y - pad)
+            y1 = min(h, y + pad + 1)
+            x0 = max(0, x - pad)
+            x1 = min(w, x + pad + 1)
+            dyn[y0:y1, x0:x1] = 1
 
     keep = (1 - dyn) * 255
     return keep.astype(np.uint8, copy=False)
 
 
+def _load_background_keep_mask_from_dataset(
+    in_dir: Path,
+    frame_id: str,
+    cam_id: str,
+) -> np.ndarray | None:
+    mask_path = in_dir / "robot_masks" / cam_id / f"{frame_id}.png"
+    if not mask_path.exists():
+        return None
+    robot_mask = np.asarray(Image.open(mask_path).convert("L"), dtype=np.uint8)
+    return (255 - robot_mask).astype(np.uint8, copy=False)
+
+
 def _pose_to_w2c(pose: np.ndarray, convention: str) -> tuple[np.ndarray, np.ndarray]:
-    if convention == "w2c":
-        return pose[:3, :3], pose[:3, 3]
-    if convention == "c2w":
-        R_wc = pose[:3, :3]
-        t_wc = pose[:3, 3]
-        R_cw = R_wc.T
-        t_cw = -R_cw @ t_wc
-        return R_cw, t_cw
-    raise ValueError(f"Unsupported pose convention: {convention}")
-
-
-def _project_in_image_ratio(
-    points: np.ndarray,
-    R_cw: np.ndarray,
-    t_cw: np.ndarray,
-    camera: CameraDef,
-    max_points: int = 4000,
-) -> tuple[float, float]:
-    if points.size == 0:
-        return 0.0, 0.0
-    pts = points
-    if pts.shape[0] > max_points:
-        idx = np.random.choice(pts.shape[0], size=max_points, replace=False)
-        pts = pts[idx]
-    Xc = (R_cw @ pts.T).T + t_cw[None, :]
-    z = Xc[:, 2]
-    in_front = z > 1e-6
-    if not np.any(in_front):
-        return 0.0, 0.0
-    Xf = Xc[in_front]
-    u = camera.fx * (Xf[:, 0] / Xf[:, 2]) + camera.cx
-    v = camera.fy * (Xf[:, 1] / Xf[:, 2]) + camera.cy
-    in_img = (u >= 0.0) & (u < camera.width) & (v >= 0.0) & (v < camera.height)
-    return float(np.mean(in_front)), float(np.mean(in_img))
-
-
-def _infer_pose_convention(
-    poses: list[dict[str, Any]],
-    cam_defs: list[CameraDef],
-    points: np.ndarray,
-) -> str:
-    if points.size == 0 or len(poses) == 0:
-        return "w2c"
-    cam_by_id = {c.cam_id: c for c in cam_defs}
-    # Score a handful of frames to avoid overhead.
-    probe = poses[: min(8, len(poses))]
-    scores: dict[str, list[float]] = {"w2c": [], "c2w": []}
-    for frame in probe:
-        cam = cam_by_id[frame["cam_id"]]
-        pose = np.asarray(frame["pose"], dtype=np.float64)
-        for conv in ("w2c", "c2w"):
-            R_cw, t_cw = _pose_to_w2c(pose, conv)
-            _, in_img = _project_in_image_ratio(points, R_cw, t_cw, cam)
-            scores[conv].append(in_img)
-    mean_w2c = float(np.mean(scores["w2c"])) if scores["w2c"] else 0.0
-    mean_c2w = float(np.mean(scores["c2w"])) if scores["c2w"] else 0.0
-    chosen = "w2c" if mean_w2c >= mean_c2w else "c2w"
-    print(
-        f"[gs_dataset_to_colmap] pose auto-detect: "
-        f"w2c_inimg={mean_w2c:.4f}, c2w_inimg={mean_c2w:.4f} -> {chosen}"
-    )
-    return chosen
+    if convention != "w2c":
+        raise ValueError(f"Unsupported pose convention: {convention}")
+    return pose[:3, :3], pose[:3, 3]
 
 
 def convert(
@@ -360,7 +306,9 @@ def convert(
     init_npz: Path | None = None,
     init_max_points: int | None = None,
     init_color: tuple[int, int, int] = (128, 128, 128),
-    pose_convention: str = "auto",
+    bg_num_points: int = 20000,
+    bg_color: tuple[int, int, int] = (96, 96, 96),
+    pose_convention: str = "w2c",
     robot_mask_urdf: Path | None = None,
     robot_mask_package_root: Path | None = None,
     robot_mask_points: int = 60000,
@@ -390,29 +338,24 @@ def convert(
     cam_id_map = {c.cam_id: c.camera_id for c in cam_defs}
     cam_by_id = {c.cam_id: c for c in cam_defs}
 
-    init_points_for_detection = np.zeros((0, 3), dtype=np.float32)
-    if init_npz is not None:
-        init_data = np.load(init_npz)
-        init_points_for_detection = np.asarray(init_data["points"], dtype=np.float32)
-        if init_max_points is not None and init_points_for_detection.shape[0] > init_max_points:
-            idx = np.random.choice(init_points_for_detection.shape[0], size=init_max_points, replace=False)
-            init_points_for_detection = init_points_for_detection[idx]
-
-    if pose_convention == "auto":
-        pose_convention = _infer_pose_convention(poses, cam_defs, init_points_for_detection)
-    elif pose_convention not in ("w2c", "c2w"):
-        raise ValueError("pose_convention must be one of: auto, w2c, c2w")
-    else:
-        print(f"[gs_dataset_to_colmap] pose convention: {pose_convention}")
+    if pose_convention != "w2c":
+        raise ValueError(
+            f"Unsupported pose convention '{pose_convention}'. "
+            "Expected 'w2c' (pipeline fixed to head_camera_calib.json semantics)."
+        )
+    print(f"[gs_dataset_to_colmap] pose convention: {pose_convention}")
 
     images_dir = out_dir / "images"
     sparse_dir = out_dir / "sparse" / "0"
     masks_dir = out_dir / "masks"
+    dataset_robot_mask_root = in_dir / "robot_masks"
     images_dir.mkdir(parents=True, exist_ok=True)
     sparse_dir.mkdir(parents=True, exist_ok=True)
 
     link_points_local: dict[str, np.ndarray] | None = None
     frame_link_T_cache: dict[str, dict[str, np.ndarray]] = {}
+    dataset_mask_count = 0
+    fk_mask_count = 0
     if robot_mask_urdf is not None:
         pkg_root = (
             robot_mask_package_root
@@ -437,6 +380,9 @@ def convert(
             print(f"[gs_dataset_to_colmap] FK mask include_regex: {robot_mask_include_regex}")
         if robot_mask_exclude_regex:
             print(f"[gs_dataset_to_colmap] FK mask exclude_regex: {robot_mask_exclude_regex}")
+    if dataset_robot_mask_root.exists():
+        masks_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[gs_dataset_to_colmap] dataset robot masks found: {dataset_robot_mask_root}")
 
     images_lines: list[str] = []
     camera_centers = []
@@ -466,14 +412,18 @@ def convert(
         )
         images_lines.append("")  # empty line for points2D
 
-        if link_points_local is not None:
+        frame_id = str(frame["frame_id"])
+        keep_mask = _load_background_keep_mask_from_dataset(in_dir, frame_id, cam_id)
+        if keep_mask is not None:
+            dataset_mask_count += 1
+            Image.fromarray(keep_mask, mode="L").save(masks_dir / dst_name)
+        elif link_points_local is not None:
             q = frame.get("q")
             if q is None:
                 raise ValueError(
                     "poses.json missing 'q' field required by FK mask. "
                     "Regenerate gs_dataset with current gs_dataset.py."
                 )
-            frame_id = str(frame["frame_id"])
             if frame_id not in frame_link_T_cache:
                 q_arr = np.asarray(q, dtype=np.float32)
                 q_map = build_q_map_from_q32(q_arr)
@@ -487,17 +437,58 @@ def convert(
                 cam_by_id[cam_id],
                 radius_px=int(robot_mask_radius_px),
             )
+            fk_mask_count += 1
             Image.fromarray(keep_mask, mode="L").save(masks_dir / dst_name)
+
+    if masks_dir.exists():
+        print(
+            f"[gs_dataset_to_colmap] mask source: dataset={dataset_mask_count}, fk_fallback={fk_mask_count}"
+        )
 
     _write_cameras_txt(sparse_dir, cam_defs)
     _write_images_txt(sparse_dir, images_lines)
 
     if init_npz is not None:
-        pts = init_points_for_detection
+        init_data = np.load(init_npz)
+        pts = np.asarray(init_data["points"], dtype=np.float32)
         if init_max_points is not None and pts.shape[0] > init_max_points:
             idx = np.random.choice(pts.shape[0], size=init_max_points, replace=False)
             pts = pts[idx]
         rgb = np.tile(np.array(init_color, dtype=np.uint8)[None, :], (pts.shape[0], 1))
+
+        if int(bg_num_points) > 0:
+            camera_centers = np.asarray(camera_centers, dtype=np.float32)
+            span = (
+                np.linalg.norm(camera_centers.max(axis=0) - camera_centers.min(axis=0))
+                if camera_centers.shape[0] > 0
+                else 0.0
+            )
+            if span < 0.05 and len(poses) > 0:
+                probe = poses[0]
+                probe_cam = cam_by_id[probe["cam_id"]]
+                probe_pose = np.asarray(probe["pose"], dtype=np.float64)
+                probe_R_cw, probe_t_cw = _pose_to_w2c(probe_pose, pose_convention)
+                bg_pts = _sample_points_in_front_of_camera(
+                    probe_cam,
+                    probe_R_cw,
+                    probe_t_cw,
+                    num_points=int(bg_num_points),
+                    depth_min=0.5,
+                    depth_max=2.5,
+                )
+                print(
+                    f"[gs_dataset_to_colmap] mixed init bg points (frustum): "
+                    f"span={span:.6f}m, points={len(bg_pts)}"
+                )
+            else:
+                bg_pts = _sample_points(camera_centers, num_points=int(bg_num_points))
+                print(f"[gs_dataset_to_colmap] mixed init bg points: points={len(bg_pts)}")
+
+            if bg_pts.shape[0] > 0:
+                bg_rgb = np.tile(np.array(bg_color, dtype=np.uint8)[None, :], (bg_pts.shape[0], 1))
+                pts = np.concatenate([pts, bg_pts], axis=0)
+                rgb = np.concatenate([rgb, bg_rgb], axis=0)
+
         _write_points3D_txt(sparse_dir, pts, rgb=rgb)
     else:
         camera_centers = np.asarray(camera_centers, dtype=np.float32)
@@ -539,10 +530,17 @@ def main() -> None:
     parser.add_argument("--init-max-points", type=int, default=None, help="Downsample init points")
     parser.add_argument("--init-color", default="128,128,128", help="RGB for init points, e.g. 128,128,128")
     parser.add_argument(
+        "--bg-num-points",
+        type=int,
+        default=20000,
+        help="Extra synthetic background points mixed with --init-npz points",
+    )
+    parser.add_argument("--bg-color", default="96,96,96", help="RGB for background synthetic points")
+    parser.add_argument(
         "--pose-convention",
-        default="auto",
-        choices=["auto", "w2c", "c2w"],
-        help="Interpretation of poses.json matrices",
+        default="w2c",
+        choices=["w2c"],
+        help="Interpretation of poses.json matrices (fixed to w2c)",
     )
     parser.add_argument("--robot-mask-urdf", default=None, help="Enable FK robot mask with this URDF path")
     parser.add_argument("--robot-mask-package-root", default=None, help="Package root for URDF mesh resolving")
@@ -564,6 +562,8 @@ def main() -> None:
     init_npz = Path(args.init_npz) if args.init_npz else None
     color_parts = [int(x) for x in args.init_color.replace(" ", "").split(",")]
     init_color = (color_parts[0], color_parts[1], color_parts[2])
+    bg_color_parts = [int(x) for x in args.bg_color.replace(" ", "").split(",")]
+    bg_color = (bg_color_parts[0], bg_color_parts[1], bg_color_parts[2])
 
     convert(
         Path(args.in_dir),
@@ -572,6 +572,8 @@ def main() -> None:
         init_npz=init_npz,
         init_max_points=args.init_max_points,
         init_color=init_color,
+        bg_num_points=args.bg_num_points,
+        bg_color=bg_color,
         pose_convention=args.pose_convention,
         robot_mask_urdf=Path(args.robot_mask_urdf) if args.robot_mask_urdf else None,
         robot_mask_package_root=Path(args.robot_mask_package_root) if args.robot_mask_package_root else None,
