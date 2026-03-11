@@ -3,7 +3,7 @@
 Export a 2x2 debug panel for robot training diagnostics.
 
 Panel layout:
-  [0,0] Original image
+  [0,0] Prior points (camera view)
   [0,1] Mask (white=bg keep, black=robot)
   [1,0] GT robot region only (mask-applied)
   [1,1] Render result
@@ -41,12 +41,14 @@ def _label(im: Image.Image, text: str) -> Image.Image:
 def main() -> None:
     p = argparse.ArgumentParser(description="Export 2x2 robot debug panel")
     p.add_argument("--orig", required=True, help="Original GT image path")
+    p.add_argument("--prior", required=True, help="Prior points projection image path")
     p.add_argument("--mask", required=True, help="Mask path (white=bg, black=robot)")
     p.add_argument("--render", required=True, help="Render image path")
     p.add_argument("--out", required=True, help="Output panel image path")
     args = p.parse_args()
 
     orig = _load_rgb(Path(args.orig))
+    prior = _load_rgb(Path(args.prior))
     mask = _load_l(Path(args.mask))
     render = _load_rgb(Path(args.render))
 
@@ -57,7 +59,7 @@ def main() -> None:
 
     mask_rgb = Image.merge("RGB", (mask, mask, mask))
 
-    a = _label(orig, "Original")
+    a = _label(prior, "Prior Points")
     b = _label(mask_rgb, "Mask (white=bg)")
     c = _label(gt_robot, "GT Robot Region")
     d = _label(render, "Render")
@@ -77,4 +79,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

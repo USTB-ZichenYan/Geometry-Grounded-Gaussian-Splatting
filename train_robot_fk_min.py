@@ -76,6 +76,35 @@ def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (x * mask).sum() / denom
 
 
+def _set_group_lr(optimizer: torch.optim.Optimizer, group_name: str, lr: float) -> None:
+    for g in optimizer.param_groups:
+        if g.get("name") == group_name:
+            g["lr"] = float(lr)
+            return
+
+
+def _project_in_image_ratio(cam, xyz_world: torch.Tensor) -> Tuple[float, float]:
+    # xyz_world: (N,3) in world frame
+    # Camera conventions can differ by transpose direction depending on loader path.
+    # For preflight gate robustness, test both and keep the better one.
+    R = cam.R.to(xyz_world.device)
+    T = cam.T.to(xyz_world.device)
+
+    def _score(Xc: torch.Tensor) -> Tuple[float, float]:
+        in_front = Xc[:, 2] > 1e-6
+        if int(in_front.sum().item()) == 0:
+            return 0.0, 0.0
+        Xf = Xc[in_front]
+        u = cam.Fx * (Xf[:, 0] / Xf[:, 2]) + cam.Cx
+        v = cam.Fy * (Xf[:, 1] / Xf[:, 2]) + cam.Cy
+        in_img = (u >= 0) & (u < cam.image_width) & (v >= 0) & (v < cam.image_height)
+        return float(in_front.float().mean().item()), float(in_img.float().mean().item())
+
+    s1 = _score(xyz_world @ R.T + T[None, :])
+    s2 = _score(xyz_world @ R + T[None, :])
+    return s1 if s1[1] >= s2[1] else s2
+
+
 class FKDeformer:
     def __init__(
         self,
@@ -133,12 +162,20 @@ def main() -> None:
     parser.add_argument("--lambda-robot", type=float, default=3.0)
     parser.add_argument("--lambda-alpha-bg", type=float, default=0.05)
     parser.add_argument("--lambda-alpha-fg", type=float, default=0.05)
-    parser.add_argument("--freeze-scale", type=int, default=0, help="1: freeze gaussian scale; 0: allow scale learning")
+    parser.add_argument("--lambda-scale-reg", type=float, default=0.0, help="L2 regularization on log-scale w.r.t. init")
+    parser.add_argument("--freeze-scale", type=int, default=1, help="1: freeze gaussian scale; 0: allow scale learning")
     parser.add_argument("--freeze-rotation", type=int, default=0, help="1: freeze gaussian rotation; 0: allow rotation learning")
     parser.add_argument("--lock-opacity-one", type=int, default=1, help="1: lock opacity to ~1 (no opacity learning)")
     parser.add_argument("--scale-init-mul", type=float, default=1.0, help="Multiply initial gaussian scale before training")
+    parser.add_argument("--stage-a-iters", type=int, default=1000, help="Stage-A iterations: freeze scale+rotation")
     parser.add_argument("--frame-order", choices=["sequential", "random"], default="sequential")
     parser.add_argument("--steps-per-frame", type=int, default=1)
+    parser.add_argument("--preflight-check", type=int, default=1, help="Run geometry/mask quick gate before training")
+    parser.add_argument("--preflight-strict", type=int, default=1, help="Fail fast if preflight gate does not pass")
+    parser.add_argument("--gate-min-inimg", type=float, default=0.30, help="Min projected in-image ratio (of in-front points)")
+    parser.add_argument("--gate-min-mask-fg", type=float, default=0.001, help="Min robot mask area ratio")
+    parser.add_argument("--gate-max-mask-fg", type=float, default=0.90, help="Max robot mask area ratio")
+    parser.add_argument("--gate-min-alpha-fg", type=float, default=0.001, help="Min mean alpha in robot region")
     parser.add_argument("--save-every", type=int, default=1000)
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(sys.argv[1:])
@@ -167,6 +204,8 @@ def main() -> None:
     scene = Scene(dataset, gaussians, shuffle=False)
     gaussians.training_setup(opt)
     gaussians.reset_3D_filter()
+    base_scaling_lr = float(args.scaling_lr)
+    base_rotation_lr = float(args.rotation_lr)
     if int(args.lock_opacity_one) == 1:
         # Sigmoid(logit) cannot be exactly 1.0; use a numerically stable near-opaque target.
         target_alpha = 1.0 - 1e-6
@@ -185,6 +224,7 @@ def main() -> None:
             "Rebuild colmap from matching init npz."
         )
     fk = FKDeformer(local_xyz=local_xyz, link_ids=link_ids, link_names=link_names, urdf_path=Path(args.urdf))
+    scale_log0 = gaussians._scaling.detach().clone()
 
     cam_by_name = {cam.image_name: cam for cam in scene.getTrainCameras()}
     train_entries = []
@@ -200,12 +240,51 @@ def main() -> None:
         raise RuntimeError("No train entries found.")
     print(f"[data] train cameras={len(train_entries)}")
 
+    if int(args.preflight_check) == 1:
+        cam0, q0, name0 = train_entries[0]
+        fk.apply(q0, gaussians._xyz.data)
+        with torch.no_grad():
+            pkg0 = render(cam0, gaussians, pipe, torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device=gaussians.get_xyz.device), dataset.kernel_size, require_depth=False)
+            a0 = pkg0["mask"].clamp(0.0, 1.0)
+            gt_mask0 = (cam0.gt_mask > float(args.robot_mask_thr)).float().to(a0.device)
+            robot0 = (1.0 - gt_mask0).clamp(0.0, 1.0)
+            fg_ratio = float(robot0.mean().item())
+            alpha_in_fg = float(_masked_mean(a0, robot0).item())
+            alpha_in_bg = float(_masked_mean(a0, gt_mask0).item())
+            in_front_ratio, in_img_ratio = _project_in_image_ratio(cam0, gaussians.get_xyz.detach())
+        ok = True
+        if not (float(args.gate_min_mask_fg) <= fg_ratio <= float(args.gate_max_mask_fg)):
+            ok = False
+        if in_img_ratio < float(args.gate_min_inimg):
+            ok = False
+        if alpha_in_fg < float(args.gate_min_alpha_fg):
+            ok = False
+        if alpha_in_fg <= alpha_in_bg:
+            ok = False
+        print(
+            f"[preflight] frame={name0} fg_ratio={fg_ratio:.4f} in_front={in_front_ratio:.4f} "
+            f"in_img={in_img_ratio:.4f} alpha_fg={alpha_in_fg:.4f} alpha_bg={alpha_in_bg:.4f} ok={ok}"
+        )
+        if (not ok) and int(args.preflight_strict) == 1:
+            raise RuntimeError("Preflight gate failed. Check pose/mask alignment before training.")
+
     bg_black = torch.tensor([0.0, 0.0, 0.0], dtype=torch.float32, device=gaussians.get_xyz.device)
     gaussians.optimizer.zero_grad(set_to_none=True)
     pbar = tqdm(range(1, int(opt.iterations) + 1), desc="Robot FK MIN training")
     steps_per_frame = max(1, int(args.steps_per_frame))
 
     for it in pbar:
+        # Two-stage schedule:
+        # Stage A (early): freeze scale + rotation to let color fit first.
+        # Stage B (later): restore configured scale/rotation lrs.
+        if int(args.stage_a_iters) > 0:
+            if it <= int(args.stage_a_iters):
+                _set_group_lr(gaussians.optimizer, "scaling", 0.0)
+                _set_group_lr(gaussians.optimizer, "rotation", 0.0)
+            elif it == int(args.stage_a_iters) + 1:
+                _set_group_lr(gaussians.optimizer, "scaling", base_scaling_lr)
+                _set_group_lr(gaussians.optimizer, "rotation", base_rotation_lr)
+
         if args.frame_order == "random":
             idx = int(np.random.randint(0, len(train_entries)))
         else:
@@ -231,6 +310,11 @@ def main() -> None:
             + float(args.lambda_alpha_bg) * alpha_bg
             + float(args.lambda_alpha_fg) * alpha_fg
         )
+        if float(args.lambda_scale_reg) > 0.0 and int(args.freeze_scale) == 0:
+            scale_reg = torch.mean((gaussians._scaling - scale_log0) ** 2)
+            loss = loss + float(args.lambda_scale_reg) * scale_reg
+        else:
+            scale_reg = torch.zeros([], dtype=loss.dtype, device=loss.device)
         loss.backward()
         gaussians.optimizer.step()
         gaussians.optimizer.zero_grad(set_to_none=True)
@@ -243,6 +327,7 @@ def main() -> None:
                     "robot": f"{robot_photo.item():.4f}",
                     "alpha_bg": f"{alpha_bg.item():.4f}",
                     "alpha_fg": f"{alpha_fg.item():.4f}",
+                    "scale_reg": f"{scale_reg.item():.4f}",
                 }
             )
 

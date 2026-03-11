@@ -1,0 +1,23 @@
+{
+  "split_dir": "/home/SENSETIME/yanzichen/data/file/Geometry-Grounded-Gaussian-Splatting/robotics_world_model/train",
+  "q_source": "target",
+  "q14_path": "/home/SENSETIME/yanzichen/data/file/Geometry-Grounded-Gaussian-Splatting/robotics_world_model/train/target_positions.npy",
+  "images_dir": "/home/SENSETIME/yanzichen/data/file/Geometry-Grounded-Gaussian-Splatting/robotics_world_model/train/images",
+  "frames_q": 100,
+  "frames_images": 100,
+  "frames_used": 100,
+  "warm_start_shape": [
+    100,
+    32
+  ],
+  "mapping": {
+    "left": [
+      2,
+      9
+    ],
+    "right": [
+      15,
+      22
+    ]
+  }
+}
