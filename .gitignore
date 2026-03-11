@@ -33,7 +33,11 @@ blender_scripts/
 .clangd
 
 # Project runtime outputs
-gggs_run/
+gggs_run/*
+!gggs_run/robot_fk_render_train_v1/
+!gggs_run/robot_fk_render_train_v1/**
+!gggs_run/robot_fk_render_test_v1/
+!gggs_run/robot_fk_render_test_v1/**
 *.pth
 *.npz
 *.ply
